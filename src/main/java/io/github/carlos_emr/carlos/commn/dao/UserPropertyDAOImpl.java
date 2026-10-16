@@ -32,6 +32,7 @@
 
 package io.github.carlos_emr.carlos.commn.dao;
 
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -148,7 +149,9 @@ public class UserPropertyDAOImpl extends AbstractDaoImpl<UserProperty> implement
     }
 
     public UserProperty getProp(String prov, String name) {
-        Query query = entityManager.createQuery("select p from UserProperty p where p.providerNo = ?1 and p.name = ?2");
+        // Oldest row first: legacy data can hold duplicate (provider, name) rows, and saveProp must
+        // update the same row getProviderPropertiesByNames reads.
+        Query query = entityManager.createQuery("select p from UserProperty p where p.providerNo = ?1 and p.name = ?2 order by p.id");
         query.setParameter(1, prov);
         query.setParameter(2, name);
 
@@ -194,6 +197,29 @@ public class UserPropertyDAOImpl extends AbstractDaoImpl<UserProperty> implement
         List<UserProperty> list = query.getResultList();
         for (UserProperty p : list) {
             map.put(p.getName(), p.getValue());
+        }
+        return map;
+    }
+
+    @Override
+    public Map<String, String> getProviderPropertiesByNames(String providerNo, Collection<String> names) {
+        Map<String, String> map = new HashMap<>();
+        if (providerNo == null || names == null || names.isEmpty()) {
+            return map;
+        }
+        Query query = entityManager.createQuery(
+                "select p from UserProperty p where p.providerNo = ?1 and p.name in ?2 order by p.id");
+        query.setParameter(1, providerNo);
+        query.setParameter(2, names);
+
+        @SuppressWarnings("unchecked")
+        List<UserProperty> list = query.getResultList();
+        for (UserProperty p : list) {
+            // Ordered by id: a duplicated name resolves to its oldest row, deterministically, even
+            // when that row's value is NULL (putIfAbsent would let a later row replace a null).
+            if (!map.containsKey(p.getName())) {
+                map.put(p.getName(), p.getValue());
+            }
         }
         return map;
     }
