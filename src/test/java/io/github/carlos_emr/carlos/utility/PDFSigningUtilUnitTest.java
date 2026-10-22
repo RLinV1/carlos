@@ -14,19 +14,32 @@ import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
 import java.security.SignatureException;
 import java.security.spec.ECGenParameterSpec;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.Map;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.cos.COSArray;
+import org.apache.pdfbox.cos.COSDictionary;
+import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDDocumentNameDictionary;
+import org.apache.pdfbox.pdmodel.PDEmbeddedFilesNameTreeNode;
+import org.apache.pdfbox.pdmodel.common.filespecification.PDComplexFileSpecification;
+import org.apache.pdfbox.pdmodel.common.filespecification.PDEmbeddedFile;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.encryption.AccessPermission;
 import org.apache.pdfbox.pdmodel.encryption.InvalidPasswordException;
 import org.apache.pdfbox.pdmodel.encryption.StandardProtectionPolicy;
 import org.apache.pdfbox.pdmodel.interactive.digitalsignature.PDSignature;
+import org.bouncycastle.asn1.ASN1EncodableVector;
 import org.bouncycastle.asn1.ASN1InputStream;
+import org.bouncycastle.asn1.ASN1OctetString;
 import org.bouncycastle.asn1.ASN1Primitive;
+import org.bouncycastle.asn1.cms.Attribute;
 import org.bouncycastle.asn1.cms.AttributeTable;
 import org.bouncycastle.asn1.cms.CMSAttributes;
 import org.bouncycastle.asn1.ess.ESSCertIDv2;
@@ -345,7 +358,7 @@ class PDFSigningUtilUnitTest {
             assertThat(Character.digit(pdf[i], 16)).as("hex digit at byte %d", i).isNotNegative();
         }
         int keyStart = Math.max(0, gapStart - 32);
-        String beforeGap = new String(pdf, keyStart, gapStart - keyStart, java.nio.charset.StandardCharsets.US_ASCII);
+        String beforeGap = new String(pdf, keyStart, gapStart - keyStart, StandardCharsets.US_ASCII);
         assertThat(beforeGap.stripTrailing()).endsWith("/Contents");
     }
 
@@ -408,6 +421,200 @@ class PDFSigningUtilUnitTest {
         assertThat(PdfSigningTestSupport.verifyDetachedSignature(signed, null)).isTrue();
         SignerInformation signer = signedData(signed, null).getSignerInfos().getSigners().iterator().next();
         assertThat(signer.getEncryptionAlgOID()).isEqualTo("1.2.840.10045.4.3.2"); // ecdsa-with-SHA256
+    }
+
+    @Test
+    @DisplayName("should embed the manifest in an unencrypted PDF, covered by the signature")
+    void shouldEmbedTheManifest_inAnUnencryptedPdf() throws Exception {
+        // The shape of a Send to myCarlos copy: no password, sealed by HPKE elsewhere.
+        DocumentManifest manifest = DocumentManifestUnitTest.fakeManifest("FAKE CBC");
+        Path signed = PDFSigningUtil.signPDF(writeSinglePagePdf(), enabledConfig(), null, manifest);
+        generatedOutputs.add(signed);
+
+        String kid = keyIdOf(signed, null);
+        assertThat(embeddedManifest(signed, null)).isEqualTo(manifest.toCanonicalJson(kid));
+        assertAssociatedAsData(signed, null);
+        assertThat(PdfSigningTestSupport.verifyDetachedSignature(signed, null)).isTrue();
+        assertWholeFileSigned(signed, null);
+    }
+
+    @Test
+    @DisplayName("should embed the manifest under the PDF's password, covered by the signature")
+    void shouldEmbedTheManifest_underTheSendPassword() throws Exception {
+        DocumentManifest manifest = DocumentManifestUnitTest.fakeManifest("FAKE CBC");
+        Path encrypted = PDFEncryptionUtil.encryptPDF(writeSinglePagePdf(), "s3cret");
+        generatedOutputs.add(encrypted);
+
+        Path signed = PDFSigningUtil.signPDF(encrypted, enabledConfig(), "s3cret", manifest);
+        generatedOutputs.add(signed);
+
+        // Without the password: the file does not open, and no manifest text is in the clear.
+        assertThatThrownBy(() -> Loader.loadPDF(signed.toFile()).close()).isInstanceOf(InvalidPasswordException.class);
+        String raw = new String(Files.readAllBytes(signed), StandardCharsets.ISO_8859_1);
+        assertThat(raw).doesNotContain("FAKE-Manifest-Patient").doesNotContain("carlos-document-manifest");
+        // With it: the manifest is there, and the signature still covers the whole file.
+        String kid = keyIdOf(signed, "s3cret");
+        assertThat(embeddedManifest(signed, "s3cret")).isEqualTo(manifest.toCanonicalJson(kid));
+        assertAssociatedAsData(signed, "s3cret");
+        assertThat(PdfSigningTestSupport.verifyDetachedSignature(signed, "s3cret")).isTrue();
+        assertWholeFileSigned(signed, "s3cret");
+    }
+
+    @Test
+    @DisplayName("should set the manifest's kid from the signing certificate")
+    void shouldSetTheKid_fromTheSigningCertificate() throws Exception {
+        Path signed = PDFSigningUtil.signPDF(writeSinglePagePdf(), enabledConfig(), null,
+                DocumentManifestUnitTest.fakeManifest("FAKE CBC"));
+        generatedOutputs.add(signed);
+
+        CMSSignedData cms = signedData(signed, null);
+        SignerInformation signer = cms.getSignerInfos().getSigners().iterator().next();
+        X509CertificateHolder certificate = (X509CertificateHolder) cms.getCertificates()
+                .getMatches(signer.getSID()).iterator().next();
+        String expected = Base64.getUrlEncoder().withoutPadding().encodeToString(
+                MessageDigest.getInstance("SHA-256").digest(certificate.getSubjectPublicKeyInfo().getEncoded()));
+        assertThat(new String(embeddedManifest(signed, null), StandardCharsets.UTF_8)).contains("\"kid\":\"" + expected + "\"");
+    }
+
+    @Test
+    @DisplayName("should keep the PDF's other embedded files")
+    void shouldKeepOtherEmbeddedFiles_whenAddingTheManifest() throws Exception {
+        Path source = tempDir.resolve("with-attachment-" + System.nanoTime() + ".pdf");
+        try (PDDocument document = new PDDocument()) {
+            document.addPage(new PDPage());
+            PDComplexFileSpecification other = new PDComplexFileSpecification();
+            other.setFile("FAKE-attachment.txt");
+            other.setEmbeddedFile(new PDEmbeddedFile(document, new ByteArrayInputStream("FAKE".getBytes(StandardCharsets.UTF_8))));
+            PDEmbeddedFilesNameTreeNode tree = new PDEmbeddedFilesNameTreeNode();
+            tree.setNames(Map.of("FAKE-attachment.txt", other));
+            PDDocumentNameDictionary names = new PDDocumentNameDictionary(document.getDocumentCatalog());
+            names.setEmbeddedFiles(tree);
+            document.getDocumentCatalog().setNames(names);
+            document.save(source.toFile());
+        }
+
+        Path signed = PDFSigningUtil.signPDF(source, enabledConfig(), null, DocumentManifestUnitTest.fakeManifest("FAKE"));
+        generatedOutputs.add(signed);
+
+        try (PDDocument document = Loader.loadPDF(signed.toFile())) {
+            assertThat(document.getDocumentCatalog().getNames().getEmbeddedFiles().getNames())
+                    .containsOnlyKeys("FAKE-attachment.txt", DocumentManifest.FILE_NAME);
+        }
+        assertThat(PdfSigningTestSupport.verifyDetachedSignature(signed, null)).isTrue();
+    }
+
+    @Test
+    @DisplayName("should bind the manifest with one signed SHA-256 attribute, in plain and encrypted PDFs")
+    void shouldBindTheManifest_withASignedDigestAttribute() throws Exception {
+        DocumentManifest manifest = DocumentManifestUnitTest.fakeManifest("FAKE CBC");
+        Path plain = PDFSigningUtil.signPDF(writeSinglePagePdf(), enabledConfig(), null, manifest);
+        generatedOutputs.add(plain);
+        Path encrypted = PDFEncryptionUtil.encryptPDF(writeSinglePagePdf(), "s3cret");
+        generatedOutputs.add(encrypted);
+        Path encryptedSigned = PDFSigningUtil.signPDF(encrypted, enabledConfig(), "s3cret", manifest);
+        generatedOutputs.add(encryptedSigned);
+
+        for (Path signed : List.of(plain, encryptedSigned)) {
+            String password = signed.equals(plain) ? null : "s3cret";
+            SignerInformation signer = signedData(signed, password).getSignerInfos().getSigners().iterator().next();
+            ASN1EncodableVector attributes = signer.getSignedAttributes().getAll(PDFSigningUtil.DOCUMENT_MANIFEST_SHA256);
+            assertThat(attributes.size()).isEqualTo(1);
+            Attribute attribute = Attribute.getInstance(attributes.get(0));
+            assertThat(attribute.getAttrValues().size()).isEqualTo(1);
+            byte[] digest = ASN1OctetString.getInstance(attribute.getAttrValues().getObjectAt(0)).getOctets();
+            // The SHA-256 of the exact embedded bytes, which the encrypted copy hides from a reader.
+            assertThat(digest).hasSize(32)
+                    .isEqualTo(MessageDigest.getInstance("SHA-256").digest(embeddedManifest(signed, password)));
+            // Signed, not unsigned: it cannot be added or changed after signing.
+            assertThat(signer.getUnsignedAttributes() == null
+                    || signer.getUnsignedAttributes().get(PDFSigningUtil.DOCUMENT_MANIFEST_SHA256) == null).isTrue();
+            // A verifier that does not know the attribute still accepts the signature.
+            assertThat(PdfSigningTestSupport.verifyDetachedSignature(signed, password)).isTrue();
+        }
+        assertThat(PDFSigningUtil.DOCUMENT_MANIFEST_SHA256.getId())
+                .isEqualTo("2.25.132515939282652475535231260060469025505");
+    }
+
+    @Test
+    @DisplayName("should carry no manifest digest when no manifest is given")
+    void shouldCarryNoManifestDigest_whenNoManifestIsGiven() throws Exception {
+        Path signed = PDFSigningUtil.signPDF(writeSinglePagePdf(), enabledConfig());
+        generatedOutputs.add(signed);
+
+        SignerInformation signer = signedData(signed, null).getSignerInfos().getSigners().iterator().next();
+        assertThat(signer.getSignedAttributes().get(PDFSigningUtil.DOCUMENT_MANIFEST_SHA256)).isNull();
+        assertThat(PdfSigningTestSupport.verifyDetachedSignature(signed, null)).isTrue();
+    }
+
+    @Test
+    @DisplayName("should store the manifest uncompressed, verbatim once, in an unencrypted copy")
+    void shouldStoreTheManifestUncompressed_inAnUnencryptedCopy() throws Exception {
+        // myCarlos also finds a plain copy's manifest verbatim inside the signed byte ranges.
+        DocumentManifest manifest = DocumentManifestUnitTest.fakeManifest("FAKE CBC");
+        Path signed = PDFSigningUtil.signPDF(writeSinglePagePdf(), enabledConfig(), null, manifest);
+        generatedOutputs.add(signed);
+
+        try (PDDocument document = Loader.loadPDF(signed.toFile())) {
+            PDComplexFileSpecification specification = document.getDocumentCatalog().getNames().getEmbeddedFiles()
+                    .getNames().get(DocumentManifest.FILE_NAME);
+            assertThat(specification.getEmbeddedFile().getCOSObject().getItem(COSName.FILTER)).isNull();
+        }
+        String raw = new String(Files.readAllBytes(signed), StandardCharsets.ISO_8859_1);
+        String json = new String(embeddedManifest(signed, null), StandardCharsets.ISO_8859_1);
+        assertThat(raw.indexOf(json)).isNotNegative();
+        assertThat(raw.indexOf(json)).isEqualTo(raw.lastIndexOf(json));
+    }
+
+    @Test
+    @DisplayName("should embed nothing when no manifest is given")
+    void shouldEmbedNoManifest_whenNoneIsGiven() throws Exception {
+        Path signed = PDFSigningUtil.signPDF(writeSinglePagePdf(), enabledConfig());
+        generatedOutputs.add(signed);
+
+        try (PDDocument document = Loader.loadPDF(signed.toFile())) {
+            assertThat(document.getDocumentCatalog().getNames()).isNull();
+            assertThat(document.getDocumentCatalog().getCOSObject().getCOSArray(COSName.AF)).isNull();
+        }
+    }
+
+    private static byte[] embeddedManifest(Path signedPdf, String password) throws Exception {
+        try (PDDocument document = password == null
+                ? Loader.loadPDF(signedPdf.toFile()) : Loader.loadPDF(signedPdf.toFile(), password)) {
+            PDComplexFileSpecification specification = document.getDocumentCatalog().getNames().getEmbeddedFiles()
+                    .getNames().get(DocumentManifest.FILE_NAME);
+            assertThat(specification.getEmbeddedFile().getSubtype()).isEqualTo("application/json");
+            return specification.getEmbeddedFile().toByteArray();
+        }
+    }
+
+    private static void assertAssociatedAsData(Path signedPdf, String password) throws Exception {
+        try (PDDocument document = password == null
+                ? Loader.loadPDF(signedPdf.toFile()) : Loader.loadPDF(signedPdf.toFile(), password)) {
+            COSArray associated = document.getDocumentCatalog().getCOSObject().getCOSArray(COSName.AF);
+            assertThat(associated).isNotNull();
+            assertThat(associated.size()).isEqualTo(1);
+            COSDictionary specification = (COSDictionary) associated.getObject(0);
+            assertThat(specification.getString(COSName.F)).isEqualTo(DocumentManifest.FILE_NAME);
+            assertThat(specification.getCOSName(COSName.AF_RELATIONSHIP).getName()).isEqualTo("Data");
+        }
+    }
+
+    private static void assertWholeFileSigned(Path signedPdf, String password) throws Exception {
+        try (PDDocument document = password == null
+                ? Loader.loadPDF(signedPdf.toFile()) : Loader.loadPDF(signedPdf.toFile(), password)) {
+            int[] byteRange = document.getSignatureDictionaries().get(0).getByteRange();
+            assertThat(byteRange[0]).isZero();
+            assertThat((long) byteRange[2] + byteRange[3]).isEqualTo(Files.size(signedPdf));
+        }
+    }
+
+    private static String keyIdOf(Path signedPdf, String password) throws Exception {
+        CMSSignedData cms = signedData(signedPdf, password);
+        SignerInformation signer = cms.getSignerInfos().getSigners().iterator().next();
+        X509CertificateHolder certificate = (X509CertificateHolder) cms.getCertificates()
+                .getMatches(signer.getSID()).iterator().next();
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(
+                MessageDigest.getInstance("SHA-256").digest(certificate.getSubjectPublicKeyInfo().getEncoded()));
     }
 
     /** The CMS object in a signed PDF's first signature, read from a stream like the shared verifier. */
