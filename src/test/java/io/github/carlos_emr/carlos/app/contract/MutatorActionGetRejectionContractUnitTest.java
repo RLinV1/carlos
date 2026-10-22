@@ -255,6 +255,8 @@ class MutatorActionGetRejectionContractUnitTest {
             Arguments.of("io.github.carlos_emr.carlos.signature.action.SaveSignatureUpload2Action",
                     "_con", "w"),
             // --- messenger ---
+            Arguments.of("io.github.carlos_emr.carlos.messenger.pageUtil.MsgCreateMessage2Action",
+                    "_msg", "w"),
             Arguments.of("io.github.carlos_emr.carlos.messenger.pageUtil.MsgTransferPostItems2Action",
                     "_msg", "w"),
             Arguments.of("io.github.carlos_emr.carlos.messenger.pageUtil.MsgAttachPDF2Action",
@@ -394,6 +396,12 @@ class MutatorActionGetRejectionContractUnitTest {
         // and its security object and must be a POST with _edoc write. Covered by
         // DmsInboxManage2ActionUnitTest (shouldReturn405_whenAddNewQueueIsNotPost).
         "io.github.carlos_emr.carlos.documentManager.actions.DmsInboxManage2Action",
+        // Report queries remain readable; saving favourites/patient sets requires POST.
+        // Covered by ReadMethodWriteGuardUnitTest, including both persistence branches.
+        "io.github.carlos_emr.carlos.report.pageUtil.RptDemographicReport2Action",
+        // PHCP role settings remain readable; role changes require an administrative POST.
+        // Covered by ViewBilledVisitProvider2ActionUnitTest and the installed daysheet workflow.
+        "io.github.carlos_emr.carlos.report.gate.ViewBilledVisitProvider2Action",
         // Incoming PDF navigation permits GET; pdfAction mutations require POST and write access.
         // Focused method/privilege tests: ViewIncomingDocuments2ActionUnitTest.
         "io.github.carlos_emr.carlos.documentManager.gate.ViewIncomingDocuments2Action",
